@@ -57,27 +57,55 @@ def decisions_cerveau():
     return par_jour
 
 
-def delai_rampe():
-    """Mediane (jours) entre `recu` et la publication, si la rampe existe et porte les deux champs. Sinon None."""
+def prises_rampe():
+    """Prises de la rampe (API :8797, repli ssh). Liste de dicts {id, recu}."""
     try:
-        txt = ssh("cat ~/tokn-data/rampe/*/etat.json 2>/dev/null")
+        with urllib.request.urlopen("http://100.125.157.100:8797/api/file", timeout=15) as f:
+            return json.load(f)["prises"]
     except Exception:
-        return None
-    dec = json.JSONDecoder(); i = 0; ds = []
-    while i < len(txt):
-        try:
-            o, k = dec.raw_decode(txt, i)
-        except ValueError:
-            i += 1; continue
-        i = k
-        r, p = o.get("recu"), o.get("publie") or o.get("publie_le")
-        if r and p:
+        txt = ssh("cat ~/tokn-data/rampe/*/etat.json 2>/dev/null")
+        dec = json.JSONDecoder(); i = 0; out = []
+        while i < len(txt):
             try:
-                ds.append((datetime.fromisoformat(p) - datetime.fromisoformat(r)).total_seconds() / 86400)
-            except Exception:
-                pass
+                o, k = dec.raw_decode(txt, i)
+            except ValueError:
+                i += 1; continue
+            i = k
+            if isinstance(o, dict) and o.get("id"):
+                out.append(o)
+        return out
+
+
+def publications_essais():
+    """{id essais_reels: publie_le} via le helper supabase() du script de recoupe."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("recoupe", os.path.expanduser("~/.local/bin/damienprime-recoupe-essais.py"))
+    R = importlib.util.module_from_spec(spec); spec.loader.exec_module(R)
+    rows = R.supabase("GET", "/rest/v1/essais_reels?select=id,publie_le&id=like.R-*&limit=1000")
+    return {r["id"]: r.get("publie_le") for r in rows}
+
+
+def delai_rampe():
+    """(nb_prises, delai_h) : prises recues sur la periode ; delai = mediane en heures de publie_le - recu (1re version publiee,
+    id essais = R-<pid sans 'p-'>-<v>). delai_h None tant qu'aucune prise n'a de publie_le (ou Supabase injoignable)."""
+    try:
+        prises = [p for p in prises_rampe() if p.get("recu")]
+    except Exception:
+        return None, None
+    prises = [p for p in prises if DEBUT.isoformat() <= p["recu"][:10] or True]
+    try:
+        pubs = publications_essais()
+    except Exception:
+        return len(prises), None
+    ds = []
+    for p in prises:
+        pre = f"R-{p['id'][2:]}-"
+        ts = [datetime.fromisoformat(v.replace("Z", "+00:00")) for k, v in pubs.items() if k.startswith(pre) and v]
+        if ts:
+            r = datetime.fromisoformat(p["recu"].replace("Z", "+00:00"))
+            ds.append((min(ts) - r).total_seconds() / 3600)
     ds.sort()
-    return round(ds[len(ds) // 2], 1) if ds else None
+    return len(prises), (round(ds[len(ds) // 2], 1) if ds else None)
 
 
 def lire_hist():
@@ -102,7 +130,7 @@ def main():
         dec = decisions_cerveau()
     except Exception as e:
         dec = None; erreurs.append("cerveau: " + str(e)[:80])
-    delai = delai_rampe()
+    nb_prises, delai = delai_rampe()
     depart_reels = sur7(jours, DEBUT - timedelta(days=1)) if jours is not None else None
     if jours is not None:  # recalcul de tout l'historique (rolling 7 j, exact depuis les dates de publication)
         j = DEBUT
@@ -117,7 +145,8 @@ def main():
             o["decisions"] = dec.get(j.isoformat(), 0)
             j += timedelta(days=1)
     if auj.isoformat() in h:
-        h[auj.isoformat()]["delai_j"] = delai
+        h[auj.isoformat()]["delai_h"] = delai
+        h[auj.isoformat()]["prises"] = nb_prises
         h[auj.isoformat()]["maj"] = datetime.now().strftime("%Y-%m-%d %H:%M")
     meta = {}
     mf = os.path.join(DONNEES, "depart.json")
@@ -126,7 +155,6 @@ def main():
     if depart_reels is not None:
         meta["reels_7j"] = depart_reels
     meta.setdefault("decisions", 0)
-    meta.setdefault("delai_j", None)
     json.dump(meta, open(mf, "w"))
     with open(HIST, "w") as f:
         for k in sorted(h):
@@ -155,8 +183,16 @@ def page(h, meta, erreurs, auj):
         v = cur.get(c); return "non lu" if v is None else v
     cumul_dec = sum(o.get("decisions") or 0 for o in h.values())
     jour_n = max(0, min(30, (auj - DEBUT).days + 1))
-    d_ref = meta.get("delai_j")
-    delai_now = cur.get("delai_j")
+    delai_now = cur.get("delai_h")
+    nbp = cur.get("prises")
+    if delai_now is None:
+        grand = "en attente de la 1re prise réelle"
+        sous_d = f"{nbp} prise(s) reçue(s) sur la rampe, aucune publiée" if nbp is not None else "rampe non lue"
+        note = "Mesure : date de réception de la prise (rampe) jusqu'à la publication (essais_reels.publie_le). Non mesuré pour l'instant."
+    else:
+        grand = f"{round(delai_now)} h" if delai_now <= 48 else f"{round(delai_now/24,1)} j"
+        sous_d = f"aujourd'hui (médiane, {nbp} prise(s) reçue(s))"
+        note = "Mesure : date de réception de la prise (rampe) jusqu'à la publication (essais_reels.publie_le), médiane."
     err = "".join(f"<p class='err'>Source en panne : {e}</p>" for e in erreurs)
     html = f"""<!doctype html><html lang="fr"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>30 jours, 3 chiffres</title>
@@ -176,9 +212,8 @@ h1{{font-size:28px;margin:8px 0 4px}}.sous{{color:#a4a6ad;margin:0 0 20px}}
 <div class="bar">{barres(h,'reels_7j',meta.get('reels_7j'))}</div>
 <p class="src">Mesuré : API Instagram Graph, reels de @damien.rsl, essais compris. TikTok et Shorts : pas de source en lecture seule branchée.</p></div>
 <div class="c"><h2>Délai entre la prise et la publication</h2><div class="duo"><div><div class="n">non mesuré</div><div class="l">départ</div></div>
-<div><div class="n b">{'non mesuré' if delai_now is None else str(delai_now)+' j'}</div><div class="l">aujourd'hui (médiane)</div></div></div>
-<div class="bar">{barres(h,'delai_j',None)}</div>
-<p class="src">Aucune date de prise fiable n'existe encore. Le chiffre apparaîtra quand la rampe notera la date de réception de chaque rush.</p></div>
+<div><div class="n b" style="font-size:{'22px' if delai_now is None else '40px'}">{grand}</div><div class="l">{sous_d}</div></div></div>
+<p class="src">{note}</p></div>
 <div class="c"><h2>Décisions prises depuis un widget</h2><div class="duo"><div><div class="n">{meta.get('decisions',0)}</div><div class="l">départ (compteur à 0 le 23/11)</div></div>
 <div><div class="n b">{val('decisions')}</div><div class="l">aujourd'hui (total {cumul_dec} sur la période)</div></div></div>
 <div class="bar">{barres(h,'decisions',None)}</div>
